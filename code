@@ -1,0 +1,293 @@
+import time
+import math
+import csv
+from collections import deque, namedtuple
+import RPi.GPIO as GPIO
+import Adafruit_ADS1x15
+
+# Usiamo namedtuple per incapsulare le metriche di una fase
+PhaseMetrics = namedtuple("PhaseMetrics", ["Vrms", "Irms", "P", "S", "PF"])
+
+# --------------------------- CONFIGURAZIONE ---------------------------
+
+# ADS1115 addresses
+ADS1_ADDR = 0x48
+ADS2_ADDR = 0x49
+
+# ADC parameters
+GAIN = 1
+DATA_RATE = 1600
+
+# Mapping canali ADS -> segnali
+ADS1_V_CH = [0, 1, 2]  # V L1,L2,L3 (A0,A1,A2)
+ADS1_I_CH = 3         # I L1 (A3)
+ADS2_I_CH = [0, 1]    # I L2, I L3 (A0,A1)
+
+# GPIO relays
+RELAY_PINS = [17, 27, 22]
+RELAY_ACTIVE_HIGH = True
+
+# Misura (parametri)
+SAMPLES = 400
+# FS_TARGET = 2000  # Frequenza target (non usata per temporizzazione ma per riferimento)
+MIN_PERIODS = 10    # Campioniamo per un multiplo di periodi di rete (es. 10 periodi a 50Hz)
+
+# Isteresi e logica di controllo
+LOWER_PF = 0.95
+UPPER_PF = 0.99
+MIN_TIME_BETWEEN_STEPS = 2.5
+SETTLING_TIME_AFTER_STEP = 1.0 # Tempo aggiuntivo per stabilizzazione condensatori
+
+# Calibrazione
+FS_VOLTAGE_BY_GAIN = {
+    2/3: 6.144, 1: 4.096, 2: 2.048, 4: 1.024, 8: 0.512, 16: 0.256
+}
+FS_VOLT = FS_VOLTAGE_BY_GAIN.get(GAIN, 4.096)
+ADC_MAX_COUNT = 32768.0
+V_PER_COUNT = FS_VOLT / ADC_MAX_COUNT
+
+# La VREF (bias) viene gestita nella calibrazione, non nella conversione campione
+VREF = 3.3 / 2.0
+
+# Fattori di calibrazione (DA TARARE)
+VOLTAGE_SCALE = 1.0   # V_linea = (V_adc - VREF) * VOLTAGE_SCALE
+BURDEN_RESISTANCE = 20.0
+CURRENT_SCALE = 1.0   # I_linea = (V_adc - VREF) / BURDEN_RESISTANCE * CURRENT_SCALE
+
+# File di log CSV
+LOG_FILENAME = "rifasamento_log.csv"
+
+# ---------------------------------------------------------------------
+
+# Classe principale per incapsulare ADC e stato
+class PowerFactorController:
+    def __init__(self):
+        self.adc1 = Adafruit_ADS1x15.ADS1115(address=ADS1_ADDR)
+        self.adc2 = Adafruit_ADS1x15.ADS1115(address=ADS2_ADDR)
+        
+        GPIO.setmode(GPIO.BCM)
+        for p in RELAY_PINS:
+            GPIO.setup(p, GPIO.OUT)
+            # Stato iniziale: tutti i gradini spenti
+            self._set_relay_state(p, False) 
+
+        self.steps = 0
+        self.max_steps = len(RELAY_PINS)
+        self.last_step_time = 0.0
+        self.log_header_written = False
+
+    def _set_relay_state(self, pin, state_on):
+        """Imposta lo stato del relè (True=ON, False=OFF)"""
+        output = GPIO.HIGH if (state_on == RELAY_ACTIVE_HIGH) else GPIO.LOW
+        GPIO.output(pin, output)
+
+    def cleanup(self):
+        GPIO.cleanup()
+
+    # --- Funzioni di conversione ottimizzate ---
+
+    def _adc_count_to_volt(self, count):
+        """Converte il conteggio ADC in Volt all'ingresso (senza rimuovere bias)"""
+        return count * V_PER_COUNT
+
+    def _adc_count_to_voltage_line(self, count):
+        """Converte Volt ADC (meno bias) in tensione di linea reale V_AC"""
+        v_adc = self._adc_count_to_volt(count)
+        # Sottrai il bias VREF e applica la calibrazione
+        v_line = (v_adc - VREF) * VOLTAGE_SCALE
+        return v_line
+
+    def _adc_count_to_current(self, count):
+        """Converte Volt ADC (meno bias) in corrente di linea reale A_AC"""
+        v_adc = self._adc_count_to_volt(count)
+        v_ac_biased = v_adc - VREF
+        # I = V_burden / R_burden
+        i = (v_ac_biased / BURDEN_RESISTANCE) * CURRENT_SCALE
+        return i
+
+    # --- Funzioni di misura e calcolo ---
+
+    def measure_window(self):
+        """
+        Legge SAMPLES campioni per i 6 canali.
+        Ritorna: v_samples, i_samples (liste di 3 liste di campioni) e il tempo impiegato (dt_total)
+        """
+        v_samples = [[] for _ in range(3)]
+        i_samples = [[] for _ in range(3)]
+        start_time = time.perf_counter()
+
+        for n in range(SAMPLES):
+            try:
+                # Leggi in sequenza tutti i canali
+                raw_v0 = self.adc1.read_adc(ADS1_V_CH[0], gain=GAIN, data_rate=DATA_RATE)
+                raw_v1 = self.adc1.read_adc(ADS1_V_CH[1], gain=GAIN, data_rate=DATA_RATE)
+                raw_v2 = self.adc1.read_adc(ADS1_V_CH[2], gain=GAIN, data_rate=DATA_RATE)
+                raw_i1 = self.adc1.read_adc(ADS1_I_CH, gain=GAIN, data_rate=DATA_RATE)
+                raw_i2 = self.adc2.read_adc(ADS2_I_CH[0], gain=GAIN, data_rate=DATA_RATE)
+                raw_i3 = self.adc2.read_adc(ADS2_I_CH[1], gain=GAIN, data_rate=DATA_RATE)
+            except IOError as e:
+                print(f"[ERR] Errore I/O I2C: {e}. Dati saltati.")
+                # Non aggiungiamo dati, rompiamo il ciclo per evitare di falsare i calcoli
+                return [[] for _ in range(3)], [[] for _ in range(3)], 0.0
+
+            # Conversione in unità fisiche (Volt e Ampere)
+            v_samples[0].append(self._adc_count_to_voltage_line(raw_v0))
+            v_samples[1].append(self._adc_count_to_voltage_line(raw_v1))
+            v_samples[2].append(self._adc_count_to_voltage_line(raw_v2))
+
+            i_samples[0].append(self._adc_count_to_current(raw_i1))
+            i_samples[1].append(self._adc_count_to_current(raw_i2))
+            i_samples[2].append(self._adc_count_to_current(raw_i3))
+
+        end_time = time.perf_counter()
+        return v_samples, i_samples, end_time - start_time
+
+    def compute_phase_metrics(self, v_array, i_array):
+        """Calcola metriche di fase da vettori campione."""
+        N = len(v_array)
+        if N == 0:
+            return PhaseMetrics(0, 0, 0, 0, 0)
+
+        # La rimozione del DC avviene qui, a livello di finestra, per Vrms/Irms/P corrette
+        v_mean = sum(v_array) / N
+        i_mean = sum(i_array) / N
+        v_ac = [x - v_mean for x in v_array]
+        i_ac = [x - i_mean for x in i_array]
+
+        # Vrms e Irms
+        v_rms = math.sqrt(sum(x*x for x in v_ac) / N)
+        i_rms = math.sqrt(sum(x*x for x in i_ac) / N)
+        
+        # Potenza Attiva (P)
+        p = sum(v*i for v,i in zip(v_ac, i_ac)) / N
+        
+        # Potenza Apparente (S)
+        s = v_rms * i_rms
+        
+        # Fattore di Potenza (PF)
+        pf = p / s if s != 0 else 0.0
+        
+        return PhaseMetrics(v_rms, i_rms, p, s, pf)
+
+    def update_bank(self, pf_total):
+        """Logica di controllo con isteresi e debounce."""
+        now = time.time()
+        action_desc = "Nessuna azione"
+
+        if now - self.last_step_time < MIN_TIME_BETWEEN_STEPS:
+            action_desc = "Hold (debounce)"
+            return action_desc
+        
+        # Se siamo appena usciti da una commutazione, attendi il settling
+        if now - self.last_step_time < SETTLING_TIME_AFTER_STEP:
+             action_desc = "Hold (settling)"
+             return action_desc
+
+
+        if pf_total < LOWER_PF and self.steps < self.max_steps:
+            # Inserisci gradino (steps = prossimo da attivare)
+            pin = RELAY_PINS[self.steps]
+            self._set_relay_state(pin, True)
+            self.steps += 1
+            self.last_step_time = now
+            action_desc = f"Inserito step {self.steps}"
+
+        elif pf_total > UPPER_PF and self.steps > 0:
+            # Rimuovi gradino (steps punta all'ultimo attivo, quindi -1)
+            self.steps -= 1
+            pin = RELAY_PINS[self.steps]
+            self._set_relay_state(pin, False)
+            self.last_step_time = now
+            action_desc = f"Rimosso step {self.steps+1}"
+            
+        return action_desc
+
+    # --- Funzioni di Logging ---
+    
+    def init_csv(self):
+        """Scrive l'intestazione del file CSV se non esiste."""
+        if self.log_header_written:
+            return
+            
+        header = ["timestamp", "T_Window_sec", 
+                  "V1_rms","I1_rms","P1","S1","PF1",
+                  "V2_rms","I2_rms","P2","S2","PF2",
+                  "V3_rms","I3_rms","P3","S3","PF3",
+                  "P_total","S_total", "PF_total","steps","action"]
+        try:
+            with open(LOG_FILENAME, "x", newline="") as f:
+                writer = csv.writer(f)
+                writer.writerow(header)
+            self.log_header_written = True
+        except FileExistsError:
+            self.log_header_written = True
+            pass
+
+    def log_row(self, data):
+        """Aggiunge una riga al file CSV."""
+        with open(LOG_FILENAME, "a", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow(data)
+
+
+    # --- Ciclo Principale ---
+
+    def run(self):
+        print("Avvio rifasamento dinamico - CTRL+C per fermare")
+        self.init_csv()
+
+        try:
+            while True:
+                v_samples, i_samples, dt_total = self.measure_window()
+                
+                # Calcola metriche per fase
+                metrics = []
+                total_P = 0.0
+                total_S = 0.0
+                
+                # Se la misura è fallita (dt_total è 0.0 o len(v_samples[0]) è 0) saltiamo.
+                if dt_total == 0.0 or not v_samples[0]:
+                    print("Misura fallita o set di dati vuoto. Riprovo...")
+                    time.sleep(1) # Attesa più lunga in caso di errore
+                    continue
+                
+                # Frequenza di campionamento effettiva
+                Fs_eff = SAMPLES / dt_total
+                
+                for ph in range(3):
+                    m = self.compute_phase_metrics(v_samples[ph], i_samples[ph])
+                    metrics.append(m)
+                    total_P += m.P
+                    total_S += m.S
+
+                # Calcolo PF totale (corretto per carichi trifase sbilanciati)
+                pf_total = total_P / total_S if total_S != 0 else None
+                
+                # Logica di controllo
+                action = self.update_bank(pf_total)
+                
+                # Stampa e Log
+                ts = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
+                row = [ts, f"{dt_total:.6f}"]
+                for m in metrics:
+                    # Usiamo stringhe formattate per il log
+                    row += [f"{m.Vrms:.3f}", f"{m.Irms:.3f}", f"{m.P:.3f}", f"{m.S:.3f}", f"{m.PF:.3f}"]
+                    
+                row += [f"{total_P:.3f}", f"{total_S:.3f}"]
+                row += [f"{pf_total:.3f}" if pf_total is not None else "NaN", self.steps, action]
+                
+                print(f"[{ts}] Fs eff: {Fs_eff:.1f} Hz | PF Totale: {pf_total:.3f} | Step: {self.steps} | Azione: {action}")
+                self.log_row(row)
+
+                # Breve attesa per evitare di monopolizzare la CPU, la temporizzazione è gestita dal loop
+                time.sleep(0.5)
+
+        except KeyboardInterrupt:
+            print("\nUscita richiesta, pulizia GPIO...")
+        finally:
+            self.cleanup()
+
+
+if __name__ == "__main__":
+    controller = PowerFactorController()
+    controller.run()
