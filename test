@@ -1,0 +1,124 @@
+import sys
+import math
+import time
+import pytest
+from unittest.mock import patch, Mock 
+
+ADS1115_mock_class = type('ADS1115', (object,), {
+    'read_adc': Mock(return_value=0), 
+})
+sys.modules['Adafruit_ADS1x15'] = sys.modules['MockADS'] = type('module', (object,), {
+    'ADS1115': ADS1115_mock_class, 
+})()
+
+MockGPIO_Module = type('module', (object,), {
+    'BCM': 11, 'OUT': 1, 'HIGH': 1, 'LOW': 0,
+    'setmode': Mock(), 'setup': Mock(), 'output': Mock(), 'cleanup': Mock(),
+})()
+MockRPi = type('module', (object,), {})()
+MockRPi.GPIO = MockGPIO_Module 
+
+sys.modules['RPi'] = MockRPi
+sys.modules['RPi.GPIO'] = MockGPIO_Module
+
+from pfc_main import (
+    PowerFactorController,
+    PhaseMetrics,
+    RELAY_PINS,
+    RELAY_ACTIVE_HIGH,
+    MIN_TIME_BETWEEN_STEPS,
+    SETTLING_TIME_AFTER_STEP,
+    LOWER_PF,
+    UPPER_PF
+)
+
+@pytest.fixture
+def controller_mock():
+    
+    MockGPIO_Instance = Mock()
+    
+    with patch('RPi.GPIO', new=MockGPIO_Instance):
+        with patch('pfc_main.Adafruit_ADS1x15.ADS1115') as MockADS:
+            controller = PowerFactorController()
+            MockGPIO_Instance.reset_mock() 
+            controller.MockGPIO = MockGPIO_Instance 
+            yield controller
+
+def test_compute_metrics_ideal_ac(controller_mock):
+    v_peak = 10.0
+    i_peak = 1.0
+
+    v_array = [v_peak, 7.071, 0.0, -7.071, -v_peak, -7.071, 0.0, 7.071] 
+    i_array = [i_peak, 0.707, 0.0, -0.707, -i_peak, -0.707, 0.0, 0.707]
+    
+    v_mean = sum(v_array) / len(v_array)
+    v_array = [v - v_mean for v in v_array]
+    
+    metrics = controller_mock.compute_phase_metrics(v_array, i_array)
+    
+    expected_v_rms = v_peak / math.sqrt(2)
+
+    assert metrics.Vrms == pytest.approx(expected_v_rms, rel=0.01) 
+    assert metrics.PF == pytest.approx(1.0, abs=1e-3)
+
+def test_compute_metrics_pf_zero(controller_mock):
+    v_array = [10, 0, -10, 0] 
+    i_array = [0, 10, 0, -10]
+    
+    metrics = controller_mock.compute_phase_metrics(v_array, i_array)
+    
+    assert metrics.P == pytest.approx(0.0, abs=1e-3) 
+    assert metrics.PF == pytest.approx(0.0, abs=1e-3) 
+
+def test_update_bank_insertion(controller_mock):
+    pf_basso = LOWER_PF - 0.01 
+    controller_mock.last_step_time = time.time() - (MIN_TIME_BETWEEN_STEPS + 1.0)
+    
+    action = controller_mock.update_bank(pf_basso)
+    
+    assert action == "Inserito step 1"
+    assert controller_mock.steps == 1
+    
+    pin_to_check = RELAY_PINS[0]
+    expected_output = controller_mock.MockGPIO.HIGH if RELAY_ACTIVE_HIGH else controller_mock.MockGPIO.LOW
+    controller_mock.MockGPIO.output.assert_called_with(pin_to_check, expected_output)
+    
+def test_update_bank_removal(controller_mock):
+    pf_alto = UPPER_PF + 0.01 
+    
+    controller_mock.steps = 2
+    controller_mock.last_step_time = time.time() - (MIN_TIME_BETWEEN_STEPS + 1.0)
+    
+    action = controller_mock.update_bank(pf_alto)
+    
+    assert action == "Rimosso step 2"
+    assert controller_mock.steps == 1 
+    
+    pin_to_check = RELAY_PINS[1] 
+    expected_output = controller_mock.MockGPIO.LOW if RELAY_ACTIVE_HIGH else controller_mock.MockGPIO.HIGH
+    controller_mock.MockGPIO.output.assert_called_with(pin_to_check, expected_output)
+
+def test_update_bank_debounce(controller_mock):
+    controller_mock.last_step_time = time.time() - (MIN_TIME_BETWEEN_STEPS - 1.5)
+    
+    action = controller_mock.update_bank(LOWER_PF - 0.1) 
+    
+    assert action == "Hold (debounce)"
+    controller_mock.MockGPIO.output.assert_not_called()
+
+def test_update_bank_settling(controller_mock):
+    
+    pf_basso = LOWER_PF - 0.01
+
+    controller_mock.steps = 0
+    controller_mock.last_step_time = time.time() - 100 
+    controller_mock.update_bank(pf_basso) 
+    controller_mock.MockGPIO.reset_mock() 
+    
+    time_passed = SETTLING_TIME_AFTER_STEP - 0.1 # e.g., 0.9s
+    controller_mock.last_step_time = time.time() - time_passed 
+    
+    action = controller_mock.update_bank(pf_basso) 
+    
+    assert action == "Hold (settling)"
+    assert controller_mock.steps == 1
